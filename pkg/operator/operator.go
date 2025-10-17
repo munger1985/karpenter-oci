@@ -52,6 +52,7 @@ const (
 	authBySession           = "SESSION"
 	authByInstancePrincipal = "INSTANCE_PRINCIPAL"
 	configFilePath          = "/etc/oci/config.yaml"
+	// configFilePath = "/home/opc/.oci/config"
 )
 
 //func init() {

@@ -17,6 +17,10 @@ package instancetype
 import (
 	"context"
 	"fmt"
+	"math"
+	"strconv"
+	"strings"
+
 	"github.com/oracle/oci-go-sdk/v65/core"
 	"github.com/samber/lo"
 	"github.com/zoom/karpenter-oci/pkg/apis/v1alpha1"
@@ -26,13 +30,10 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"knative.dev/pkg/ptr"
-	"math"
 	corev1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
-	"strconv"
-	"strings"
 )
 
 const (
@@ -130,8 +131,12 @@ func NewInstanceType(ctx context.Context, shape *internalmodel.WrapShape, nodeCl
 	if nodeClass.Spec.Kubelet != nil {
 		kc = nodeClass.Spec.Kubelet
 	}
-	return &cloudprovider.InstanceType{
-		Name:         *shape.Shape.Shape,
+
+	// Use detailed name for unique identification in maps
+	detailName := fmt.Sprintf("%s-%d-%d", *shape.Shape.Shape, shape.CalcCpu, shape.CalMemInGBs*1024)
+	// *shape.Shape.Shape
+	instanceType := &cloudprovider.InstanceType{
+		Name:         detailName,
 		Requirements: computeRequirements(ctx, shape, offerings, zones, region),
 		Offerings:    offerings,
 		Capacity:     computeCapacity(ctx, shape, kc, nodeClass),
@@ -141,6 +146,11 @@ func NewInstanceType(ctx context.Context, shape *internalmodel.WrapShape, nodeCl
 			EvictionThreshold: EvictionThreshold(resources.Quantity(fmt.Sprintf("%dGi", shape.CalMemInGBs)), resources.Quantity(fmt.Sprintf("%dGi", nodeClass.Spec.BootConfig.BootVolumeSizeInGBs)), kc),
 		},
 	}
+	// scheduling.NewRequirement("karpenter.k8s.oracle/original-shape-name", v1.NodeSelectorOpIn, *shape.Shape.Shape)
+	// Store the original shape name for OCI API calls
+	// instanceType.Requirements = instanceType.Requirements.Add()
+
+	return instanceType
 }
 
 func computeRequirements(ctx context.Context, shape *internalmodel.WrapShape, offerings cloudprovider.Offerings, zones []string, region string) scheduling.Requirements {
@@ -148,9 +158,11 @@ func computeRequirements(ctx context.Context, shape *internalmodel.WrapShape, of
 	if lo.Contains(ArmShapes, *shape.Shape.Shape) {
 		arch = "arm64"
 	}
+	detailName := fmt.Sprintf("%s-%d-%d", *shape.Shape.Shape, shape.CalcCpu, shape.CalMemInGBs*1024)
+
 	requirements := scheduling.NewRequirements(
 		// Well Known Upstream
-		scheduling.NewRequirement(v1.LabelInstanceTypeStable, v1.NodeSelectorOpIn, *shape.Shape.Shape),
+		scheduling.NewRequirement(v1.LabelInstanceTypeStable, v1.NodeSelectorOpIn, detailName),
 		scheduling.NewRequirement(v1.LabelArchStable, v1.NodeSelectorOpIn, arch),
 		scheduling.NewRequirement(v1.LabelOSStable, v1.NodeSelectorOpIn, string(v1.Linux)),
 		//scheduling.NewRequirement(v1.LabelTopologyZone, v1.NodeSelectorOpIn, lo.Map(offerings.Available(), func(o cloudprovider.Offering, _ int) string { return o.Zone })...),

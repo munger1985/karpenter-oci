@@ -18,6 +18,11 @@ import (
 	"context"
 	stderr "errors"
 	"fmt"
+	"net/http"
+	"regexp"
+	"strings"
+	"time"
+
 	"github.com/awslabs/operatorpkg/status"
 	"github.com/oracle/oci-go-sdk/v65/core"
 	"github.com/samber/lo"
@@ -34,7 +39,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"net/http"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	coreapis "sigs.k8s.io/karpenter/pkg/apis"
@@ -43,8 +47,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
-	"strings"
-	"time"
 )
 
 var _ cloudprovider.CloudProvider = (*CloudProvider)(nil)
@@ -105,6 +107,7 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *corev1.NodeClaim)
 		return nil, fmt.Errorf("resolving NodeClass readiness, NodeClass is in Ready=Unknown, %s", nodeClassReady.Message)
 	}
 	instanceTypes, err := c.resolveInstanceTypes(ctx, nodeClaim, nodeClass)
+	fmt.Println("instance types", len(instanceTypes))
 	if err != nil {
 		return nil, fmt.Errorf("resolving instance types, %w", err)
 	}
@@ -116,9 +119,24 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *corev1.NodeClaim)
 		return nil, fmt.Errorf("creating instance, %w", err)
 	}
 	instanceType, _ := lo.Find(instanceTypes, func(i *cloudprovider.InstanceType) bool {
-		return i.Name == *newInstance.Shape
+		fmt.Print(3839, i.Name, *newInstance.Shape)
+
+		if strings.Contains(i.Name, "Flex") {
+
+			re := regexp.MustCompile(`^(.*)-[0-9]+-[0-9]+$`)
+			matches := re.FindStringSubmatch(i.Name)
+			// fmt.Println(matches[1]) // Output: vm.standard.e4.flex
+			shapeName := matches[1]
+			return shapeName == *newInstance.Shape
+		} else {
+			return i.Name == *newInstance.Shape
+
+		}
+
 	})
 	nc := c.instanceToNodeClaim(ctx, newInstance, instanceType)
+	// fmt.Println("instanceToNodeClaim  ", nc)
+
 	nc.Annotations = lo.Assign(nodeClass.Annotations, map[string]string{
 		v1alpha1.AnnotationOciNodeClassHash:        nodeClass.Hash(),
 		v1alpha1.AnnotationOciNodeClassHashVersion: v1alpha1.OciNodeClassHashVersion,
@@ -173,6 +191,19 @@ func (c *CloudProvider) GetInstanceTypes(ctx context.Context, nodePool *corev1.N
 		return nil, cloudprovider.NewInsufficientCapacityError(fmt.Errorf("resolving node class, %w", err))
 	}
 	instanceTypes, err := c.instanceTypeProvider.List(ctx, nodeClass)
+	// for _, item := range instanceTypes {
+	// fmt.Println(item.Name) // 报错：type *InstanceType has no field Name
+	// if strings.HasSuffix(item.Name, "Flex") { // 仅当以 Flex 结尾时修改
+
+	// cpuStr := item.Requirements.Get("karpenter.k8s.oracle/instance-cpu").Values()[0]
+	// memStr := item.Requirements.Get("karpenter.k8s.oracle/instance-memory").Values()[0]
+
+	// item.Name = fmt.Sprintf("%s-%s-%s", item.Name, cpuStr, memStr)
+	// fmt.Println(item.Name) // 报错：type *InstanceType has no field Name
+
+	// }
+	// }
+
 	if err != nil {
 		return nil, err
 	}
@@ -187,8 +218,73 @@ func (c *CloudProvider) Delete(ctx context.Context, nodeClaim *corev1.NodeClaim)
 	return c.instanceProvider.Delete(ctx, nodeClaim.Status.ProviderID)
 }
 
-func (c *CloudProvider) IsDrifted(ctx context.Context, nodeClaim *corev1.NodeClaim) (cloudprovider.DriftReason, error) {
+func (c *CloudProvider) AlignNodeFlexShapeLabel(ctx context.Context) {
 
+	fmt.Print("12931231023123123")
+
+	var nodeList v1.NodeList
+	if err := c.kubeClient.List(ctx, &nodeList); err != nil {
+		fmt.Print(err)
+	}
+
+	// 过滤出 karpenter.sh/initialized=true 的节点
+	var targetNodes []string
+	for _, node := range nodeList.Items {
+		if node.Labels["karpenter.sh/initialized"] == "true" {
+			targetNodes = append(targetNodes, node.Name)
+		}
+	}
+
+	if len(targetNodes) == 0 {
+		fmt.Println("No nodes with karpenter.sh/initialized=true found")
+		return
+	}
+
+	// 更新节点的 node.kubernetes.io/instance-type label
+	for _, nodeName := range targetNodes {
+		var node v1.Node
+		if err := c.kubeClient.Get(ctx, types.NamespacedName{Name: nodeName}, &node); err != nil {
+			fmt.Printf("Error getting node %s: %v", nodeName, err)
+			continue
+		}
+
+		instanceType := node.Labels["node.kubernetes.io/instance-type"]
+		instanceCPU := node.Labels["karpenter.k8s.oracle/instance-cpu"]
+		instanceMemory := node.Labels["karpenter.k8s.oracle/instance-memory"]
+
+		if strings.Contains(instanceType, "Flex") {
+			newInstanceType := fmt.Sprintf("%s-%s-%s", instanceType, instanceCPU, instanceMemory)
+			node.Labels["node.kubernetes.io/instance-type"] = newInstanceType
+
+			if err := c.kubeClient.Patch(ctx, &node, client.Merge); err != nil {
+				fmt.Printf("Error updating node %s: %v", nodeName, err)
+			} else {
+				fmt.Printf("Updated node %s with new instance type: %s", nodeName, newInstanceType)
+			}
+		} else {
+			fmt.Printf("Node %s instance type %s does not contain 'Flex', skipping update", nodeName, instanceType)
+		}
+
+	}
+	for _, nodeName := range targetNodes {
+		var node v1.Node
+		if err := c.kubeClient.Get(ctx, types.NamespacedName{Name: nodeName}, &node); err != nil {
+			fmt.Printf("Error getting node %s: %v", nodeName, err)
+			continue
+		}
+
+		instanceType := node.Labels["node.kubernetes.io/instance-type"]
+
+		if strings.Contains(instanceType, "Flex") {
+			fmt.Printf("Updated node22 %s with new instance type: %s", nodeName, instanceType)
+
+		}
+
+	}
+
+}
+func (c *CloudProvider) IsDrifted(ctx context.Context, nodeClaim *corev1.NodeClaim) (cloudprovider.DriftReason, error) {
+	c.AlignNodeFlexShapeLabel(ctx)
 	// get node pool using pool name parsed from node claim label
 	nodePoolName, ok := nodeClaim.Labels[corev1.NodePoolLabelKey]
 	if !ok {
@@ -256,6 +352,8 @@ func (c *CloudProvider) resolveInstanceTypes(ctx context.Context, nodeClaim *cor
 	}
 	reqs := scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaim.Spec.Requirements...)
 	return lo.Filter(instanceTypes, func(i *cloudprovider.InstanceType, _ int) bool {
+		// fmt.Println(12323, reqs.Compatible(i.Requirements, scheduling.AllowUndefinedWellKnownLabels) == nil)
+		// fmt.Println("filts", resources.Fits(nodeClaim.Spec.Resources.Requests, i.Allocatable()))
 		return reqs.Compatible(i.Requirements, scheduling.AllowUndefinedWellKnownLabels) == nil &&
 			len(i.Offerings.Compatible(reqs).Available()) > 0 &&
 			resources.Fits(nodeClaim.Spec.Resources.Requests, i.Allocatable())
@@ -274,7 +372,18 @@ func (c *CloudProvider) resolveInstanceTypeFromInstance(ctx context.Context, ins
 		return nil, client.IgnoreNotFound(fmt.Errorf("resolving nodeclass, %w", err))
 	}
 	instanceType, _ := lo.Find(instanceTypes, func(i *cloudprovider.InstanceType) bool {
-		return i.Name == *instance.Shape
+		if strings.Contains(*instance.Shape, "Flex") {
+
+			re := regexp.MustCompile(`^(.*)-[0-9]+-[0-9]+$`)
+			matches := re.FindStringSubmatch(i.Name)
+			// fmt.Println(matches[1]) // Output: vm.standard.e4.flex
+			shapeName := matches[1]
+			return shapeName == *instance.Shape
+		} else {
+			return i.Name == *instance.Shape
+
+		}
+
 	})
 	return instanceType, nil
 }

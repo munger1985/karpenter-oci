@@ -113,6 +113,7 @@ func (p *Provider) Create(ctx context.Context, nodeClass *v1alpha1.OciNodeClass,
 	if nodeReqs.Get(corev1.CapacityTypeLabelKey).Has(v1alpha1.CapacityTypePreemptible) {
 		capacityType = v1alpha1.CapacityTypePreemptible
 	}
+	shapeName := instanceType.Requirements.Get(v1alpha1.LabelInstanceShapeName).Any()
 	req := core.LaunchInstanceRequest{LaunchInstanceDetails: core.LaunchInstanceDetails{
 		CreateVnicDetails:       &core.CreateVnicDetails{SubnetId: subnet.Id, NsgIds: sgsIds},
 		LaunchVolumeAttachments: blockDevices,
@@ -124,7 +125,7 @@ func (p *Provider) Create(ctx context.Context, nodeClass *v1alpha1.OciNodeClass,
 		CompartmentId:      common.String(options.FromContext(ctx).CompartmentId),
 		DisplayName:        common.String(nodeClaim.Name),
 		AvailabilityDomain: common.String(ad),
-		Shape:              common.String(instanceType.Name),
+		Shape:              common.String(shapeName),
 		Metadata:           metadata,
 		InstanceOptions:    &core.InstanceOptions{AreLegacyImdsEndpointsDisabled: common.Bool(true)},
 	}}
@@ -262,11 +263,11 @@ func (p *Provider) Delete(ctx context.Context, id string) error {
 		PreserveBootVolume:                 common.Bool(false),
 		PreserveDataVolumesCreatedAtLaunch: common.Bool(false)}
 	resp, err := p.compClient.TerminateInstance(ctx, req)
-	if err != nil {
-		return err
-	}
 	if resp.HTTPResponse().StatusCode == http.StatusNotFound || resp.HTTPResponse().StatusCode == http.StatusNoContent {
 		return corecloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("instance already terminated"))
+	}
+	if err != nil {
+		return err
 	}
 	return nil
 }
